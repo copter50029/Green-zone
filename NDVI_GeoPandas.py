@@ -1,9 +1,9 @@
 """
 tif_crop_to_ndvi_png.py
-GreenSight - GeoHackathon 2026
+GreenSight - GeoHackathon 2026[cite: 2]
 
 Install:
-    pip install rasterio pillow numpy
+    pip install rasterio pillow numpy scipy
 """
 
 import os
@@ -12,6 +12,7 @@ import rasterio
 from rasterio.windows import Window
 from PIL import Image
 from pathlib import Path
+import scipy.ndimage as ndimage
 
 
 def find_valid_crop_center(tif_path, size=1024, red_band=3, grid=20,
@@ -19,7 +20,7 @@ def find_valid_crop_center(tif_path, size=1024, red_band=3, grid=20,
     """
     Scan the image on a coarse grid to find a size x size region that
     actually contains real (non-NoData) data, instead of assuming the
-    center of the full canvas has data.
+    center of the full canvas has data.[cite: 2]
     """
     with rasterio.open(tif_path) as src:
         nodata = src.nodata
@@ -34,8 +35,6 @@ def find_valid_crop_center(tif_path, size=1024, red_band=3, grid=20,
                 row_off = min(gr * step_r, max(0, src.height - size))
                 col_off = min(gc * step_c, max(0, src.width - size))
 
-                # cheap check: sample a small patch at the center and all
-                # four corners of the candidate window.
                 corners = [
                     (row_off, col_off),
                     (row_off, col_off + size - 64),
@@ -78,9 +77,9 @@ def crop_to_ndvi_png(tif_path, png_path, center_row=None, center_col=None,
                       size=1024, red_band=3, nir_band=4, green_band=2, blue_band=1,
                       scale_max=4095, auto_find_center=True):
     """
-    Crop a size x size window (default 1024x1024) from the .tif and
-    save three images: a false-color-infrared PNG, a true-color original PNG, 
-    and a grayscale PNG.
+    Crop a size x size window from the .tif and save two images:
+    1. False-color-infrared PNG (for NDVI calculation)
+    2. True-color original PNG (with percentile contrast stretch for realistic brightness)
     """
     if center_row is None or center_col is None:
         if auto_find_center:
@@ -104,41 +103,58 @@ def crop_to_ndvi_png(tif_path, png_path, center_row=None, center_col=None,
         print(f"Cropping window: row_off={row_off}, col_off={col_off}, "
               f"size={actual_w}x{actual_h}")
 
-        # Read bands
+        # Read bands[cite: 2]
         red = src.read(red_band, window=window).astype("float32")
         nir = src.read(nir_band, window=window).astype("float32")
         green = src.read(green_band, window=window).astype("float32")
         
-        # Read blue band for true color
+        # Read blue band for true color[cite: 2]
         try:
             blue = src.read(blue_band, window=window).astype("float32")
         except IndexError:
-            # Fallback in case a 3-band image is provided without a blue band
             print("WARNING: Blue band not found. Falling back to green for the blue channel.")
             blue = green.copy()
 
         nodata = src.nodata
 
-    def scale(arr):
+    # 1. False-Color Linear Scaling (Keeps math exact for compute_ndvi_from_png)
+    def scale_false_color(arr):
         scaled = np.clip(arr / scale_max * 255, 0, 255)
         if nodata is not None:
             scaled[arr == nodata] = 0
         return scaled.astype("uint8")
 
-    # False Color Channels
-    fc_r = scale(nir)     # NIR stored in R channel
-    fc_g = scale(red)     # RED stored in G channel
-    fc_b = scale(green)   # GREEN stored in B channel
-    
-    # Original True Color Channels
-    tc_r = scale(red)
-    tc_g = scale(green)
-    tc_b = scale(blue)
-
+    fc_r = scale_false_color(nir)     # NIR stored in R channel[cite: 2]
+    fc_g = scale_false_color(red)     # RED stored in G channel[cite: 2]
+    fc_b = scale_false_color(green)   # GREEN stored in B channel[cite: 2]
     rgb_false_color = np.dstack([fc_r, fc_g, fc_b])
-    rgb_original = np.dstack([tc_r, tc_g, tc_b])
 
-    # Pad to exactly size x size if we hit an image edge
+    # 2. True-Color Percentile Contrast Stretch (Fixes dark original image)
+    rgb_original = np.zeros((actual_h, actual_w, 3), dtype="uint8")
+    raw_channels = [red, green, blue]
+
+    valid_mask = (red != nodata) if nodata is not None else np.ones((actual_h, actual_w), dtype=bool)
+
+    for c in range(3):
+        ch = raw_channels[c]
+        valid_pixels = ch[valid_mask]
+        
+        if len(valid_pixels) > 0:
+            # 2nd and 98th percentile stretch brings natural daylight brightness
+            p_low, p_high = np.percentile(valid_pixels, (2, 98))
+            if p_high > p_low:
+                ch_scaled = np.clip((ch - p_low) / (p_high - p_low) * 255.0, 0, 255)
+            else:
+                ch_scaled = np.clip(ch / scale_max * 255.0, 0, 255)
+        else:
+            ch_scaled = ch
+
+        if nodata is not None:
+            ch_scaled[~valid_mask] = 0
+            
+        rgb_original[:, :, c] = ch_scaled.astype("uint8")
+
+    # Pad to exactly size x size if we hit an image edge[cite: 2]
     def pad_image(rgb_array):
         if rgb_array.shape[0] != size or rgb_array.shape[1] != size:
             padded = np.zeros((size, size, 3), dtype="uint8")
@@ -149,29 +165,21 @@ def crop_to_ndvi_png(tif_path, png_path, center_row=None, center_col=None,
     rgb_false_color = pad_image(rgb_false_color)
     rgb_original = pad_image(rgb_original)
 
-    # Prepare file paths
+    # Prepare file paths[cite: 2]
     base, ext = os.path.splitext(png_path)
     fc_path = f"{base}_false_color{ext}"
     orig_path = f"{base}_original{ext}"
-    gray_path = f"{base}_grayscale{ext}"
 
-    # 1. Save False Color
+    # Save False Color[cite: 2]
     img_fc = Image.fromarray(rgb_false_color, mode="RGB")
     img_fc.save(fc_path)
     print(f"Saved false-color-infrared PNG -> {fc_path} ({size}x{size})")
-    print("  (Red channel=NIR, Green channel=RED, Blue channel=GREEN - vegetation will look red/pink)")
 
-    # 2. Save Original True Color
+    # Save Brightened True Color Original[cite: 2]
     img_orig = Image.fromarray(rgb_original, mode="RGB")
     img_orig.save(orig_path)
-    print(f"Saved original true-color PNG -> {orig_path} ({size}x{size})")
+    print(f"Saved original true-color PNG (contrast enhanced) -> {orig_path} ({size}x{size})")
 
-    # 3. Save Grayscale (converted from original true color)
-    img_gray = img_orig.convert("L")
-    img_gray.save(gray_path)
-    print(f"Saved grayscale PNG -> {gray_path} ({size}x{size})")
-
-    # Returning the false color path specifically so the downstream NDVI calculation still works
     return fc_path
 
 
@@ -179,13 +187,12 @@ def compute_ndvi_from_png(png_path, scale_max=4095):
     """
     Recover an APPROXIMATE NDVI directly from a PNG saved by
     crop_to_ndvi_png(), by reversing the 0-255 scaling back toward
-    the original value range, then applying the standard formula:
-        NDVI = (NIR - RED) / (NIR + RED)
+    the original value range.[cite: 2]
     """
     img = np.array(Image.open(png_path).convert("RGB")).astype("float32")
 
-    nir_approx = img[:, :, 0] / 255.0 * scale_max   # R channel -> NIR
-    red_approx = img[:, :, 1] / 255.0 * scale_max   # G channel -> RED
+    nir_approx = img[:, :, 0] / 255.0 * scale_max   # R channel -> NIR[cite: 2]
+    red_approx = img[:, :, 1] / 255.0 * scale_max   # G channel -> RED[cite: 2]
 
     denom = nir_approx + red_approx
     denom[denom == 0] = 1e-6
@@ -201,46 +208,63 @@ def compute_ndvi_from_png(png_path, scale_max=4095):
 
 def save_ndvi_mask(ndvi, output_path):
     """
-    Saves a mask where Black (0) represents valid plantable areas 
+    Saves a mask where Black (0) represents valid plantable areas
     and White (255) represents non-plantable areas or boundaries.
+    Applies morphological operations for smooth grouping.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Initialize the entire mask as White (255 = Cannot plant)
+    # Initialize mask as White (255 = Cannot plant)[cite: 2]
     mask = np.full(ndvi.shape, 255, dtype=np.uint8)
 
     h, w = ndvi.shape
     margin = max(10, min(h, w) // 20)
-    
-    # Extract the inner region to avoid edge artifacts
+
+    # Extract inner region[cite: 2]
     inner = ndvi[margin:h-margin, margin:w-margin]
-    
-    # Define the target NDVI range (assuming 0.2 to 0.4 is plantable criteria)
+
+    # Target NDVI range for planting
     can_plant_mask = (inner >= 0.2) & (inner <= 0.4)
+
+    # Morphological Grouping
+    structure_5x5 = np.ones((5, 5))
+    structure_3x3 = np.ones((3, 3))
+
+    # Connect nearby plantable blobs
+    can_plant_mask = ndimage.binary_closing(can_plant_mask, structure=structure_5x5)
+    # Filter out tiny isolated specks (noise)
+    can_plant_mask = ndimage.binary_opening(can_plant_mask, structure=structure_3x3)
 
     # Apply Black (0) where we CAN plant, and White (255) where we CANNOT
     mask[margin:h-margin, margin:w-margin] = np.where(can_plant_mask, 0, 255)
 
     Image.fromarray(mask, mode="L").save(output_path)
     print(f"Saved plantable mask (Black=Plant, White=No-Plant) to: {output_path}")
-    
-    return output_path
+
+    return output_path, mask
 
 
 if __name__ == "__main__":
-    # ---- EDIT THESE BEFORE RUNNING ----
-    INPUT_TIF = "C:\\Users\\User\\OneDrive\\Desktop\\New folder\\geohackathon\\Theos2.tif"
-    OUTPUT_PNG_BASE = "C:\\Users\\User\\OneDrive\\Desktop\\New folder\\geohackathon\\crop_1024.png"
-    OUTPUT_MASK_PNG = "C:\\Users\\User\\OneDrive\\Desktop\\New folder\\geohackathon\\plantable_mask.png"
-    # ------------------------------------
+    base_dir = Path(__file__).resolve().parent
+    input_tif = base_dir / "Theos2.tif"
+    output_png_base = base_dir / "crop_1024.png"
+    output_mask_png = base_dir / "plantable_mask.png"
 
-    # Generate false-color, original, and grayscale PNGs
-    fc_png_path = crop_to_ndvi_png(INPUT_TIF, OUTPUT_PNG_BASE, size=1024)
+    # 1. Generate false-color and brightened true-color PNGs[cite: 2]
+    fc_png_path = crop_to_ndvi_png(str(input_tif), str(output_png_base), size=1024)
 
-    # Compute NDVI from the false-color PNG
+    # 2. Compute NDVI from false-color PNG[cite: 2]
     ndvi, green_mask = compute_ndvi_from_png(fc_png_path)
-    print(f"\nNDVI successfully computed FROM THE PNG FILE - no need to reopen the original .tif.")
+    print("\nNDVI successfully computed FROM THE PNG FILE - no need to reopen the original .tif.")
 
-    # Save the masked area
-    save_ndvi_mask(ndvi, OUTPUT_MASK_PNG)
+    # 3. Save plantable mask and return matrix[cite: 2]
+    mask_path, mask_matrix = save_ndvi_mask(ndvi, output_mask_png)
+
+    print(f"\nExtracted mask matrix with shape: {mask_matrix.shape}")
+    print(f"Unique values in matrix: {np.unique(mask_matrix)}")
+
+    # Optional: Save matrix values to CSV
+    csv_path = base_dir / "plantable_mask_matrix.csv"
+    np.savetxt(csv_path, mask_matrix, fmt="%d", delimiter=",")
+    print(f"Saved raw matrix data to: {csv_path}")
