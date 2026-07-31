@@ -1,9 +1,45 @@
 """
-tif_crop_to_ndvi_png.py
-GreenSight - GeoHackathon 2026[cite: 2]
+greensight_demo.py
+GreenSight - GeoHackathon 2026
+
+Purpose:
+    Build a self-contained DEMO of the GreenSight pipeline:
+      1. Grid-cut the full .tif into non-overlapping 1024x1024 tiles
+      2. Auto-select 3 tiles that actually contain real data (not NoData)
+      3. For each of the 3 tiles, generate:
+           - a viewable false-color crop (NIR/RED/GREEN composite)
+           - an NDVI colormap visualization (so NDVI values are visually
+             checkable, not just a black/white guess)
+           - a black/white plantability mask:
+               BLACK = candidate area where a tree COULD be planted
+                       (low NDVI - grey/bare/abandoned zone)
+               WHITE = area where planting is NOT recommended here
+                       (high NDVI - already vegetated / existing green zone)
+      4. Package everything into one HTML demo page, plus a link to the
+         full-image interactive pan/zoom viewer (see tif_interactive_viewer.py)
+
+    Does NOT process the whole multi-GB image - only the 3 selected
+    1024x1024 tiles are ever read at full resolution, as requested.
+
+IMPORTANT NOTE ON NDVI ACCURACY (read before trusting the mask):
+    Plain NDVI thresholding can genuinely misclassify some pixels:
+      - Certain rooftop materials (especially bright/reflective or some
+        painted metal roofs) reflect more NIR than typical impervious
+        surfaces, which can push their NDVI up toward "vegetation"
+        range even though they are buildings, not plants.
+      - Bare/waste land with sparse dry grass or mixed soil can show
+        LOWER NDVI than expected, sometimes looking similar to bare
+        pavement.
+    This is a known, real limitation of using NDVI alone - not a bug
+    in this script. The NDVI colormap output is included specifically
+    so you can visually sanity-check the mask against the real crop,
+    rather than trusting the black/white result blindly. If this
+    matters for your final accuracy requirement (>=80%), consider
+    adding a building mask (e.g. from OSM footprints) to exclude
+    known structures from the "plantable" class, on top of NDVI.
 
 Install:
-    pip install rasterio pillow numpy scipy
+    pip install rasterio numpy pillow matplotlib
 """
 
 import os
@@ -11,260 +47,273 @@ import numpy as np
 import rasterio
 from rasterio.windows import Window
 from PIL import Image
-from pathlib import Path
-import scipy.ndimage as ndimage
+import matplotlib
+from scipy import ndimage
 
 
-def find_valid_crop_center(tif_path, size=1024, red_band=3, grid=20,
-                            min_valid_fraction=0.5):
-    """
-    Scan the image on a coarse grid to find a size x size region that
-    actually contains real (non-NoData) data, instead of assuming the
-    center of the full canvas has data.[cite: 2]
-    """
+# =================================================================
+# STEP 1: Grid-cut the image into non-overlapping tiles
+# =================================================================
+def grid_cut_tiles(tif_path, size=1024):
+    """Return a list of (row_off, col_off) covering the full image in a grid."""
     with rasterio.open(tif_path) as src:
-        nodata = src.nodata
-        best = None
-        best_fraction = 0.0
+        height, width = src.height, src.width
 
-        step_r = max(1, (src.height - size) // grid)
-        step_c = max(1, (src.width - size) // grid)
+    tiles = []
+    for row_off in range(0, height, size):
+        for col_off in range(0, width, size):
+            # keep only full-size tiles (skip partial edge tiles for a clean demo)
+            if row_off + size <= height and col_off + size <= width:
+                tiles.append((row_off, col_off))
+    return tiles
 
-        for gr in range(grid + 1):
-            for gc in range(grid + 1):
-                row_off = min(gr * step_r, max(0, src.height - size))
-                col_off = min(gc * step_c, max(0, src.width - size))
 
-                corners = [
-                    (row_off, col_off),
-                    (row_off, col_off + size - 64),
-                    (row_off + size - 64, col_off),
-                    (row_off + size - 64, col_off + size - 64),
-                    (row_off + size // 2 - 32, col_off + size // 2 - 32),
-                ]
-                fractions = []
+# =================================================================
+# STEP 2: Keep only tiles that actually contain real (non-NoData) data
+# 5-point check (center + 4 corners) so partially-empty tiles near
+# the footprint edge are correctly rejected, not just center-checked.
+# =================================================================
+def is_tile_valid(src, row_off, col_off, size, red_band, min_valid_fraction=0.98):
+    nodata = src.nodata
+    if nodata is None:
+        return True
 
-                for r, c in corners:
-                    sample = src.read(
-                        red_band,
-                        window=Window(c, r, 64, 64),
-                    )
-                    fractions.append(1.0 if nodata is None else float((sample != nodata).mean()))
+    check_size = 48
+    points = [
+        (row_off + size // 2 - check_size // 2, col_off + size // 2 - check_size // 2),  # center
+        (row_off, col_off),                                                              # top-left
+        (row_off, col_off + size - check_size),                                          # top-right
+        (row_off + size - check_size, col_off),                                          # bottom-left
+        (row_off + size - check_size, col_off + size - check_size),                      # bottom-right
+    ]
+    for r, c in points:
+        sample = src.read(red_band, window=Window(c, r, check_size, check_size))
+        if (sample == nodata).mean() > (1 - min_valid_fraction):
+            return False
+    return True
 
-                valid_fraction = float(np.mean(fractions))
-                all_clean = all(f >= 0.95 for f in fractions)
 
-                if valid_fraction > best_fraction:
-                    best_fraction = valid_fraction
-                    best = (row_off + size // 2, col_off + size // 2)
+def select_demo_tiles(tif_path, n=3, size=1024, red_band=3, spread=True):
+    """
+    Find tiles that pass the validity check and pick n of them, spread
+    out across the valid list so the 3 demo tiles aren't all clustered
+    in one corner of the image.
+    """
+    all_tiles = grid_cut_tiles(tif_path, size=size)
 
-                if best_fraction >= min_valid_fraction and all_clean:
-                    print(f"Found strong candidate crop center at row={best[0]}, "
-                          f"col={best[1]} ({valid_fraction*100:.0f}% average valid data; "
-                          f"corners/center clean)")
-                    return best
+    with rasterio.open(tif_path) as src:
+        valid_tiles = [
+            t for t in all_tiles
+            if is_tile_valid(src, t[0], t[1], size, red_band)
+        ]
 
-    if best is not None:
-        print(f"Best candidate found: row={best[0]}, col={best[1]} "
-              f"({best_fraction*100:.0f}% valid data - not fully clean, "
-              f"consider a smaller crop size or manual center)")
+    print(f"Grid-cut into {len(all_tiles)} tiles total, {len(valid_tiles)} contain real data.")
+
+    if not valid_tiles:
+        raise RuntimeError("No valid (data-containing) tiles found - check band/nodata settings.")
+
+    if len(valid_tiles) <= n:
+        return valid_tiles
+
+    if spread:
+        idxs = np.linspace(0, len(valid_tiles) - 1, n).astype(int)
+        return [valid_tiles[i] for i in idxs]
     else:
-        print("WARNING: could not find any region with real data.")
-    return best
+        return valid_tiles[:n]
 
 
-def crop_to_ndvi_png(tif_path, png_path, center_row=None, center_col=None,
-                      size=1024, red_band=3, nir_band=4, green_band=2, blue_band=1,
-                      scale_max=4095, auto_find_center=True):
+# =================================================================
+# STEP 3: Per-tile outputs - crop / NDVI colormap / black-white mask
+# =================================================================
+def scale_uint8(arr, scale_max, nodata=None):
+    scaled = np.clip(arr / scale_max * 255, 0, 255)
+    if nodata is not None:
+        scaled[arr == nodata] = 0
+    return scaled.astype("uint8")
+
+
+def remove_small_regions(binary_mask, min_pixels):
     """
-    Crop a size x size window from the .tif and save two images:
-    1. False-color-infrared PNG (for NDVI calculation)
-    2. True-color original PNG (with percentile contrast stretch for realistic brightness)
-    """
-    if center_row is None or center_col is None:
-        if auto_find_center:
-            print("No crop center given - scanning for a region with real data...")
-            found = find_valid_crop_center(tif_path, size=size, red_band=red_band)
-            if found is not None:
-                center_row, center_col = found
-        
-        if center_row is None or center_col is None:
-            with rasterio.open(tif_path) as src:
-                center_row = center_row or src.height // 2
-                center_col = center_col or src.width // 2
+    Remove connected regions smaller than min_pixels from a boolean
+    mask, flipping them to the opposite value. Used to clean up noise
+    in the plantability mask - both tiny misclassified specks (small
+    'not plantable' islands sitting inside a plantable area, likely
+    noise rather than a real feature) and impractically small
+    plantable patches (too small to actually plant a tree in).
 
+    Uses scipy.ndimage.label, which has a stable, version-independent
+    API (unlike skimage.morphology.remove_small_objects, whose
+    min_size/max_size parameter was renamed in skimage 0.26 - the
+    same kind of API break that caused the earlier matplotlib error).
+    """
+    labeled, n_regions = ndimage.label(binary_mask)
+    if n_regions == 0:
+        return binary_mask.copy()
+
+    sizes = ndimage.sum(binary_mask, labeled, range(1, n_regions + 1))
+    cleaned = binary_mask.copy()
+    for region_id, size in enumerate(sizes, start=1):
+        if size < min_pixels:
+            cleaned[labeled == region_id] = False
+    return cleaned
+
+
+def process_tile(tif_path, row_off, col_off, size, out_dir, tile_id,
+                  red_band=3, nir_band=4, green_band=2,
+                  scale_max=4095, ndvi_threshold=0.3,
+                  min_not_plantable_pixels=80, min_plantable_pixels=200):
     with rasterio.open(tif_path) as src:
-        row_off = max(0, min(center_row - size // 2, src.height - size))
-        col_off = max(0, min(center_col - size // 2, src.width - size))
-        actual_h = min(size, src.height - row_off)
-        actual_w = min(size, src.width - col_off)
-        window = Window(col_off, row_off, actual_w, actual_h)
-
-        print(f"Cropping window: row_off={row_off}, col_off={col_off}, "
-              f"size={actual_w}x{actual_h}")
-
-        # Read bands[cite: 2]
+        window = Window(col_off, row_off, size, size)
         red = src.read(red_band, window=window).astype("float32")
         nir = src.read(nir_band, window=window).astype("float32")
         green = src.read(green_band, window=window).astype("float32")
-        
-        # Read blue band for true color[cite: 2]
-        try:
-            blue = src.read(blue_band, window=window).astype("float32")
-        except IndexError:
-            print("WARNING: Blue band not found. Falling back to green for the blue channel.")
-            blue = green.copy()
-
         nodata = src.nodata
 
-    # 1. False-Color Linear Scaling (Keeps math exact for compute_ndvi_from_png)
-    def scale_false_color(arr):
-        scaled = np.clip(arr / scale_max * 255, 0, 255)
-        if nodata is not None:
-            scaled[arr == nodata] = 0
-        return scaled.astype("uint8")
+    os.makedirs(out_dir, exist_ok=True)
 
-    fc_r = scale_false_color(nir)     # NIR stored in R channel[cite: 2]
-    fc_g = scale_false_color(red)     # RED stored in G channel[cite: 2]
-    fc_b = scale_false_color(green)   # GREEN stored in B channel[cite: 2]
-    rgb_false_color = np.dstack([fc_r, fc_g, fc_b])
+    # --- (a) false-color crop, viewable like a normal image ---
+    crop_rgb = np.dstack([
+        scale_uint8(nir, scale_max, nodata),
+        scale_uint8(red, scale_max, nodata),
+        scale_uint8(green, scale_max, nodata),
+    ])
+    crop_path = os.path.join(out_dir, f"tile{tile_id}_crop.png")
+    Image.fromarray(crop_rgb, mode="RGB").save(crop_path)
 
-    # 2. True-Color Percentile Contrast Stretch (Fixes dark original image)
-    rgb_original = np.zeros((actual_h, actual_w, 3), dtype="uint8")
-    raw_channels = [red, green, blue]
-
-    valid_mask = (red != nodata) if nodata is not None else np.ones((actual_h, actual_w), dtype=bool)
-
-    for c in range(3):
-        ch = raw_channels[c]
-        valid_pixels = ch[valid_mask]
-        
-        if len(valid_pixels) > 0:
-            # 2nd and 98th percentile stretch brings natural daylight brightness
-            p_low, p_high = np.percentile(valid_pixels, (2, 98))
-            if p_high > p_low:
-                ch_scaled = np.clip((ch - p_low) / (p_high - p_low) * 255.0, 0, 255)
-            else:
-                ch_scaled = np.clip(ch / scale_max * 255.0, 0, 255)
-        else:
-            ch_scaled = ch
-
-        if nodata is not None:
-            ch_scaled[~valid_mask] = 0
-            
-        rgb_original[:, :, c] = ch_scaled.astype("uint8")
-
-    # Pad to exactly size x size if we hit an image edge[cite: 2]
-    def pad_image(rgb_array):
-        if rgb_array.shape[0] != size or rgb_array.shape[1] != size:
-            padded = np.zeros((size, size, 3), dtype="uint8")
-            padded[: rgb_array.shape[0], : rgb_array.shape[1], :] = rgb_array
-            return padded
-        return rgb_array
-
-    rgb_false_color = pad_image(rgb_false_color)
-    rgb_original = pad_image(rgb_original)
-
-    # Prepare file paths[cite: 2]
-    base, ext = os.path.splitext(png_path)
-    fc_path = f"{base}_false_color{ext}"
-    orig_path = f"{base}_original{ext}"
-
-    # Save False Color[cite: 2]
-    img_fc = Image.fromarray(rgb_false_color, mode="RGB")
-    img_fc.save(fc_path)
-    print(f"Saved false-color-infrared PNG -> {fc_path} ({size}x{size})")
-
-    # Save Brightened True Color Original[cite: 2]
-    img_orig = Image.fromarray(rgb_original, mode="RGB")
-    img_orig.save(orig_path)
-    print(f"Saved original true-color PNG (contrast enhanced) -> {orig_path} ({size}x{size})")
-
-    return fc_path
-
-
-def compute_ndvi_from_png(png_path, scale_max=4095):
-    """
-    Recover an APPROXIMATE NDVI directly from a PNG saved by
-    crop_to_ndvi_png(), by reversing the 0-255 scaling back toward
-    the original value range.[cite: 2]
-    """
-    img = np.array(Image.open(png_path).convert("RGB")).astype("float32")
-
-    nir_approx = img[:, :, 0] / 255.0 * scale_max   # R channel -> NIR[cite: 2]
-    red_approx = img[:, :, 1] / 255.0 * scale_max   # G channel -> RED[cite: 2]
-
-    denom = nir_approx + red_approx
+    # --- (b) NDVI colormap (visually checkable, not just binary) ---
+    denom = nir + red
     denom[denom == 0] = 1e-6
-    ndvi = (nir_approx - red_approx) / denom
+    ndvi = (nir - red) / denom
+    ndvi_norm = np.clip((ndvi + 1) / 2, 0, 1)  # map [-1,1] -> [0,1] for colormap
+    ndvi_colored = (matplotlib.colormaps["RdYlGn"](ndvi_norm)[:, :, :3] * 255).astype("uint8")
+    ndvi_path = os.path.join(out_dir, f"tile{tile_id}_ndvi.png")
+    Image.fromarray(ndvi_colored, mode="RGB").save(ndvi_path)
 
-    green_mask = ndvi >= 0.3
+    # --- (c) black/white plantability mask, noise-cleaned ---
+    # BLACK (0)   = plantable candidate (NDVI below threshold - grey/bare zone)
+    # WHITE (255) = not recommended here (NDVI at/above threshold - already green)
+    raw_not_plantable = ndvi >= ndvi_threshold  # True = white/not-plantable
 
-    print(f"NDVI from PNG: min={ndvi.min():.3f}, max={ndvi.max():.3f}, "
-          f"mean={ndvi.mean():.3f}, green_pixels={green_mask.sum()}/{green_mask.size}")
+    # Pass 1: remove tiny "not plantable" specks (likely noise, not a
+    # real feature) sitting inside otherwise-plantable areas.
+    not_plantable_clean = remove_small_regions(raw_not_plantable, min_not_plantable_pixels)
 
-    return ndvi, green_mask
+    # Pass 2: remove tiny plantable islands too small to practically
+    # plant a tree in (flips them to "not plantable").
+    plantable = ~not_plantable_clean
+    plantable_clean = remove_small_regions(plantable, min_plantable_pixels)
+
+    mask = np.where(~plantable_clean, 255, 0).astype("uint8")
+    mask_path = os.path.join(out_dir, f"tile{tile_id}_mask.png")
+    Image.fromarray(mask, mode="L").save(mask_path)
+
+    plantable_pct = (mask == 0).mean() * 100
+    print(f"Tile {tile_id}: row_off={row_off}, col_off={col_off}, "
+          f"plantable area = {plantable_pct:.1f}%")
+
+    return {
+        "tile_id": tile_id, "row_off": row_off, "col_off": col_off,
+        "crop_path": crop_path, "ndvi_path": ndvi_path, "mask_path": mask_path,
+        "plantable_pct": round(plantable_pct, 1),
+    }
 
 
-def save_ndvi_mask(ndvi, output_path):
-    """
-    Saves a mask where Black (0) represents valid plantable areas
-    and White (255) represents non-plantable areas or boundaries.
-    Applies morphological operations for smooth grouping.
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+# =================================================================
+# STEP 4: Build the HTML demo gallery
+# =================================================================
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>GreenSight Demo</title>
+<style>
+  body {{ font-family: -apple-system, sans-serif; background:#0e0e0e; color:#eee; margin:0; padding:24px; }}
+  h1 {{ color: #7ed957; }}
+  .full-link {{ display:block; margin-bottom:28px; padding:14px; background:#1a1a1a;
+                border-radius:8px; color:#7ed957; text-decoration:none; }}
+  .tile {{ display:flex; gap:12px; margin-bottom:32px; background:#1a1a1a; padding:16px; border-radius:8px; }}
+  .tile img {{ width: 300px; height:300px; object-fit:cover; border-radius:6px; }}
+  .tile .col {{ text-align:center; }}
+  .tile .col p {{ margin:6px 0 0; font-size:13px; color:#aaa; }}
+  .badge {{ display:inline-block; background:#2a2a2a; padding:2px 8px; border-radius:4px; font-size:12px; }}
+  .note {{ font-size:13px; color:#999; max-width:900px; line-height:1.5; }}
+</style>
+</head>
+<body>
+  <h1>GreenSight - Demo (3 sample tiles, {size}x{size} px each)</h1>
+  <a class="full-link" href="{full_preview_path}" target="_blank">
+    View full image (downsampled preview) &rarr;
+  </a>
+  <p class="note">For a full pan/zoom interactive view of the entire image
+  (not just downsampled), run <code>tif_interactive_viewer.py</code> separately.</p>
 
-    # Initialize mask as White (255 = Cannot plant)[cite: 2]
-    mask = np.full(ndvi.shape, 255, dtype=np.uint8)
+  {tiles_html}
 
-    h, w = ndvi.shape
-    margin = max(10, min(h, w) // 20)
+  <p class="note"><b>NDVI accuracy note:</b> the black/white mask uses a simple
+  NDVI threshold ({threshold}). Some rooftop materials can reflect enough NIR to
+  falsely resemble vegetation, and sparse/dry bare land can show lower NDVI than
+  expected. Use the NDVI colormap column to visually sanity-check the mask -
+  it is not guaranteed to be pixel-perfect from NDVI alone.</p>
+</body>
+</html>
+"""
 
-    # Extract inner region[cite: 2]
-    inner = ndvi[margin:h-margin, margin:w-margin]
+TILE_TEMPLATE = """
+  <div class="tile">
+    <div class="col"><img src="{crop_rel}"><p>Tile {tile_id}<br>False-color crop</p></div>
+    <div class="col"><img src="{ndvi_rel}"><p>NDVI colormap<br>(red=low, green=high)</p></div>
+    <div class="col"><img src="{mask_rel}"><p>Plantability mask<br>
+        <span class="badge">black = plantable ({plantable_pct}%)</span></p></div>
+  </div>
+"""
 
-    # Target NDVI range for planting
-    can_plant_mask = (inner >= 0.2) & (inner <= 0.4)
 
-    # Morphological Grouping
-    structure_5x5 = np.ones((5, 5))
-    structure_3x3 = np.ones((3, 3))
+def build_demo(tif_path, out_dir, n_tiles=3, size=1024, full_preview_path=None,
+                scale_max=4095, ndvi_threshold=0.3,
+                min_not_plantable_pixels=80, min_plantable_pixels=200):
+    os.makedirs(out_dir, exist_ok=True)
 
-    # Connect nearby plantable blobs
-    can_plant_mask = ndimage.binary_closing(can_plant_mask, structure=structure_5x5)
-    # Filter out tiny isolated specks (noise)
-    can_plant_mask = ndimage.binary_opening(can_plant_mask, structure=structure_3x3)
+    selected = select_demo_tiles(tif_path, n=n_tiles, size=size)
 
-    # Apply Black (0) where we CAN plant, and White (255) where we CANNOT
-    mask[margin:h-margin, margin:w-margin] = np.where(can_plant_mask, 0, 255)
+    results = []
+    for i, (row_off, col_off) in enumerate(selected, start=1):
+        result = process_tile(tif_path, row_off, col_off, size, out_dir, i,
+                               scale_max=scale_max, ndvi_threshold=ndvi_threshold,
+                               min_not_plantable_pixels=min_not_plantable_pixels,
+                               min_plantable_pixels=min_plantable_pixels)
+        results.append(result)
 
-    Image.fromarray(mask, mode="L").save(output_path)
-    print(f"Saved plantable mask (Black=Plant, White=No-Plant) to: {output_path}")
+    tiles_html = "".join(
+        TILE_TEMPLATE.format(
+            crop_rel=os.path.basename(r["crop_path"]),
+            ndvi_rel=os.path.basename(r["ndvi_path"]),
+            mask_rel=os.path.basename(r["mask_path"]),
+            tile_id=r["tile_id"], plantable_pct=r["plantable_pct"],
+        ) for r in results
+    )
 
-    return output_path, mask
+    html = HTML_TEMPLATE.format(
+        size=size,
+        full_preview_path=full_preview_path or "preview.png",
+        tiles_html=tiles_html,
+        threshold=ndvi_threshold,
+    )
+
+    html_path = os.path.join(out_dir, "greensight_demo.html")
+    with open(html_path, "w") as f:
+        f.write(html)
+
+    print(f"\nDemo built -> {html_path}")
+    print(f"Open that file in a browser to view the demo.")
+    return html_path, results
 
 
 if __name__ == "__main__":
-    base_dir = Path(__file__).resolve().parent
-    input_tif = base_dir / "Theos2.tif"
-    output_png_base = base_dir / "crop_1024.png"
-    output_mask_png = base_dir / "plantable_mask.png"
+    # ---- EDIT THESE BEFORE RUNNING ----
+    INPUT_TIF = r"C:\Users\User\OneDrive\Desktop\New folder\geohackathon\Theos2.tif"
+    OUT_DIR = r"C:\Users\User\OneDrive\Desktop\New folder\geohackathon\demo"
+    FULL_PREVIEW = "preview.png"  # generate this first with tif_to_png_preview.py
+    # ------------------------------------
 
-    # 1. Generate false-color and brightened true-color PNGs[cite: 2]
-    fc_png_path = crop_to_ndvi_png(str(input_tif), str(output_png_base), size=1024)
-
-    # 2. Compute NDVI from false-color PNG[cite: 2]
-    ndvi, green_mask = compute_ndvi_from_png(fc_png_path)
-    print("\nNDVI successfully computed FROM THE PNG FILE - no need to reopen the original .tif.")
-
-    # 3. Save plantable mask and return matrix[cite: 2]
-    mask_path, mask_matrix = save_ndvi_mask(ndvi, output_mask_png)
-
-    print(f"\nExtracted mask matrix with shape: {mask_matrix.shape}")
-    print(f"Unique values in matrix: {np.unique(mask_matrix)}")
-
-    # Optional: Save matrix values to CSV
-    csv_path = base_dir / "plantable_mask_matrix.csv"
-    np.savetxt(csv_path, mask_matrix, fmt="%d", delimiter=",")
-    print(f"Saved raw matrix data to: {csv_path}")
+    build_demo(INPUT_TIF, OUT_DIR, n_tiles=3, size=1024,
+               full_preview_path=FULL_PREVIEW, scale_max=4095, ndvi_threshold=0.3)
